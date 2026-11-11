@@ -459,6 +459,21 @@ pub fn pill(ui: &mut Ui, label: &str, glyph: Option<char>, primary: bool) -> Res
     resp
 }
 
+/// A shelf's "More": a small outlined pill beside its arrows, opening the page with all of it.
+fn more_link(ui: &mut Ui, shelf: &str) -> Response {
+    let text = ui.painter().layout_no_wrap("More".to_owned(), theme::semibold(13.0), Color32::PLACEHOLDER);
+    let (rect, resp) = ui.allocate_exact_size(vec2(text.size().x + 30.0, 32.0), Sense::click());
+    let resp = named(resp, &format!("More of {shelf}")).on_hover_cursor(egui::CursorIcon::PointingHand);
+    let h = theme::anim_bool(ui.ctx(), resp.id.with("h"), resp.hovered(), 0.15);
+    let c = &crate::preset::active().app.controls;
+    let r = rect.shrink(if resp.is_pointer_button_down_on() { (1.0 - c.press_scale) * 10.0 } else { 0.0 });
+    ui.painter().rect_filled(r, 16.0, theme::glass(c.button_hover.max(0.08) * h));
+    ui.painter().rect_stroke(r, 16.0, egui::Stroke::new(1.0, theme::glass(0.22 + 0.1 * h)), egui::StrokeKind::Inside);
+    focus_ring(ui, &resp, r, 16.0);
+    ui.painter().galley(r.center() - text.size() / 2.0, text, theme::lerp_color(theme::text_dim(), theme::text(), h.max(0.6)));
+    resp
+}
+
 /// A round button the height of a [`pill`], for a menu of what doesn't need a button of its own.
 pub fn more_pill(ui: &mut Ui, name: &str) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(38.0), Sense::click());
@@ -668,7 +683,8 @@ pub fn paint_disc(ui: &Ui, center: Pos2, r: f32, thumbs: &[Thumb], angle: f32, t
 }
 
 /// Album/playlist/artist/song card with hover zoom, scrim and a play button.
-pub fn card(ui: &mut Ui, c: &Card, width: f32, liked: bool, acts: &mut Vec<Action>) {
+/// `not_interested`: Home can be told to stop showing it, from its menu.
+pub fn card(ui: &mut Ui, c: &Card, width: f32, liked: bool, not_interested: bool, acts: &mut Vec<Action>) {
     let height = width + 58.0;
     let (rect, resp) = ui.allocate_exact_size(vec2(width, height), Sense::click());
     if !ui.is_rect_visible(rect) {
@@ -739,10 +755,10 @@ pub fn card(ui: &mut Ui, c: &Card, width: f32, liked: bool, acts: &mut Vec<Actio
     // On the subtitle line, whose width leaves room for it, so a two-line title never sits under it.
     let more_rect = Rect::from_center_size(pos2(rect.right() - 16.0, sub_y + 8.0), Vec2::splat(30.0));
     let more = more_button(ui, more_rect, resp.id.with("more"), "Options");
-    menu_popup(&more).show(|ui| card_menu_contents(ui, c, liked, acts));
+    menu_popup(&more).show(|ui| card_menu_contents(ui, c, liked, not_interested, acts));
     // Right-click anywhere on the card opens the same menu, even on the play button,
     // a linked name or ⋮, which take the click themselves.
-    resp.container_context_menu(|ui| card_menu_contents(ui, c, liked, acts));
+    resp.container_context_menu(|ui| card_menu_contents(ui, c, liked, not_interested, acts));
 
     if play_hit {
         match &c.target {
@@ -755,9 +771,9 @@ pub fn card(ui: &mut Ui, c: &Card, width: f32, liked: bool, acts: &mut Vec<Actio
     }
 }
 
-pub fn card_menu_contents(ui: &mut Ui, c: &Card, liked: bool, acts: &mut Vec<Action>) {
+pub fn card_menu_contents(ui: &mut Ui, c: &Card, liked: bool, not_interested: bool, acts: &mut Vec<Action>) {
     match &c.target {
-        Target::Song(t) => song_menu(ui, t, liked, None, acts),
+        Target::Song(t) => song_menu(ui, t, liked, None, not_interested, acts),
         t => {
             menu_body(ui, crate::preset::active().app.menu_look.min_px);
             if menu_action(ui, Some(icon::PLAY), "Play") {
@@ -773,7 +789,18 @@ pub fn card_menu_contents(ui: &mut Ui, c: &Card, liked: bool, acts: &mut Vec<Act
             if menu_action(ui, None, "Copy link") {
                 acts.push(Action::Share(t.clone()));
             }
+            if not_interested {
+                not_interested_action(ui, t, acts);
+            }
         }
+    }
+}
+
+/// A home item's last menu row: it leaves Home, and YouTube Music recommends less like it.
+fn not_interested_action(ui: &mut Ui, target: &Target, acts: &mut Vec<Action>) {
+    menu_divider(ui);
+    if menu_action(ui, Some(icon::X), "Not interested") {
+        acts.push(Action::NotInterested(target.clone()));
     }
 }
 
@@ -910,9 +937,13 @@ pub fn menu_action(ui: &mut Ui, glyph: Option<char>, label: &str) -> bool {
 }
 
 /// `remove`: the song's row in the open playlist, when it's yours and the song can come out.
-pub fn song_menu(ui: &mut Ui, t: &Track, liked: bool, remove: Option<usize>, acts: &mut Vec<Action>) {
+/// `not_interested`: it's one of Home's, which can be told to stop showing it.
+pub fn song_menu(ui: &mut Ui, t: &Track, liked: bool, remove: Option<usize>, not_interested: bool, acts: &mut Vec<Action>) {
     menu_body(ui, crate::preset::active().app.menu_look.min_px);
     song_actions(ui, t, liked, remove, acts);
+    if not_interested {
+        not_interested_action(ui, &Target::Song(t.clone()), acts);
+    }
 }
 
 /// The song menu's items, for menus that add their own (now playing's options).
@@ -1124,6 +1155,11 @@ pub struct RowOpts {
     pub selected: Option<bool>,
     /// The row's index in your own open playlist, so its menu can take it out.
     pub remove: Option<usize>,
+    /// The row's place in the queue: under the pointer, a button that takes it out stands
+    /// where its length was.
+    pub dequeue: Option<usize>,
+    /// One of Home's songs: its menu can tell YouTube Music you're not interested.
+    pub not_interested: bool,
 }
 
 
@@ -1296,7 +1332,19 @@ pub fn track_row(ui: &mut Ui, t: &Track, o: &RowOpts, acts: &mut Vec<Action>) ->
             }
         }
     }
-    if let Some(d) = t.duration {
+    // Not `hovered`: pressing the button counts as the start of dragging the row.
+    if let Some(i) = o.dequeue.filter(|_| base.contains_pointer()) {
+        // In place of the length, and looking like the menu button beside it.
+        let x = Rect::from_center_size(pos2(right - 13.0, cy), Vec2::splat(30.0));
+        let xr = named(ui.interact(x, base.id.with("rm"), Sense::click()), "Remove from queue").on_hover_text("Remove from queue").on_hover_cursor(egui::CursorIcon::PointingHand);
+        if xr.hovered() {
+            ui.painter().rect_filled(x, 7.0, theme::glass(0.16));
+        }
+        icon_at(ui, x.center(), icon::X, 16.0, if xr.hovered() { theme::text() } else { theme::text_dim() });
+        if xr.clicked() {
+            acts.push(Action::QueueRemove(i));
+        }
+    } else if let Some(d) = t.duration {
         digits_at(ui, pos2(right, cy), &super::fmt_time(d), theme::regular(13.0), dim);
     }
     let more_rect = Rect::from_center_size(pos2(rect.right() - 20.0, cy), Vec2::splat(30.0));
@@ -1305,14 +1353,14 @@ pub fn track_row(ui: &mut Ui, t: &Track, o: &RowOpts, acts: &mut Vec<Action>) ->
     let open_id = more_id.with("open");
     if !rl.hover_menu || hovered || ui.data(|d| d.get_temp::<bool>(open_id).unwrap_or(false)) {
         let more = more_button(ui, more_rect, more_id, "Song options");
-        menu_popup(&more).show(|ui| song_menu(ui, t, o.liked, o.remove, acts));
+        menu_popup(&more).show(|ui| song_menu(ui, t, o.liked, o.remove, o.not_interested, acts));
         if rl.hover_menu {
             let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&more));
             ui.data_mut(|d| d.insert_temp(open_id, open));
         }
     }
     // Right-click anywhere on the row opens the same menu.
-    context_popup(&resp).show(|ui| song_menu(ui, t, o.liked, o.remove, acts));
+    context_popup(&resp).show(|ui| song_menu(ui, t, o.liked, o.remove, o.not_interested, acts));
     resp
 }
 
@@ -1344,10 +1392,11 @@ fn checkbox(ui: &Ui, c: Pos2, on: bool) {
     }
 }
 
-/// Section header with optional strapline/avatar and ‹ › scroll arrows.
-/// Returns (scroll left, scroll right) clicks.
-pub fn shelf_header(ui: &mut Ui, title: &str, strap: Option<&str>, strap_thumb: Option<&str>, arrows: bool) -> (bool, bool) {
-    let mut res = (false, false);
+/// Section header with optional strapline/avatar and ‹ › scroll arrows, and with `more` a
+/// button for the page that has all of it.
+/// Returns (scroll left, scroll right, more) clicks.
+pub fn shelf_header(ui: &mut Ui, title: &str, strap: Option<&str>, strap_thumb: Option<&str>, arrows: bool, more: bool) -> (bool, bool, bool) {
+    let mut res = (false, false, false);
     let look = &crate::preset::active().app;
     ui.add_space(26.0);
     ui.horizontal(|ui| {
@@ -1363,11 +1412,17 @@ pub fn shelf_header(ui: &mut Ui, title: &str, strap: Option<&str>, strap_thumb: 
             }
             ui.label(egui::RichText::new(title).font(theme::weighted(look.heading_weight, look.heading_px)).extra_letter_spacing(look.heading_tracking_em * look.heading_px).color(theme::text()));
         });
-        if arrows {
+        if arrows || more {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let turn = crate::preset::active().app.controls.arrow_hover;
-                res.1 = icon_button_turning(ui, icon::CHEVRON_RIGHT, 18.0, &format!("Scroll {title} right"), false, turn).clicked();
-                res.0 = icon_button_turning(ui, icon::CHEVRON_LEFT, 18.0, &format!("Scroll {title} left"), false, turn).clicked();
+                if arrows {
+                    let turn = crate::preset::active().app.controls.arrow_hover;
+                    res.1 = icon_button_turning(ui, icon::CHEVRON_RIGHT, 18.0, &format!("Scroll {title} right"), false, turn).clicked();
+                    res.0 = icon_button_turning(ui, icon::CHEVRON_LEFT, 18.0, &format!("Scroll {title} left"), false, turn).clicked();
+                }
+                if more {
+                    ui.add_space(6.0);
+                    res.2 = more_link(ui, title).clicked();
+                }
             });
         }
     });

@@ -122,6 +122,12 @@ impl App {
                 self.explore = Some(e);
                 self.loading = false;
             }
+            Resp::Feed { feed, cards } => {
+                if self.page == Page::Feed(feed.clone()) {
+                    self.loading = false;
+                }
+                self.feed = Some((feed, cards));
+            }
             Resp::VideoStream { video_id, stream } => {
                 if let Some((id, player)) = &mut self.video
                     && *id == video_id

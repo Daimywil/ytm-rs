@@ -1,7 +1,7 @@
 //! Page bodies. Every page fades and slides in when navigated to.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 
 use egui::{Align2, Color32, Rect, RichText, Sense, Ui, Vec2, pos2, vec2};
@@ -11,7 +11,7 @@ use super::find::ListFind;
 use super::row_drag::{self, RowDrag};
 use super::{Action, App, LibTab, Page, Selection};
 use crate::backend::compact;
-use crate::model::{Card, ShelfKind, Target, Track};
+use crate::model::{Card, Feed, ShelfKind, Target, Track};
 use crate::theme::{self, icon};
 
 const CARD: f32 = 180.0;
@@ -59,6 +59,7 @@ pub fn page(app: &mut App, ui: &mut Ui, now: f64) {
             Page::Settings => {}
             Page::Transfer => super::transfer::page(app, ui, now),
             Page::Jam => super::jam::page(app, ui),
+            Page::Feed(f) => feed(app, ui, f, now),
         }
         ui.add_space(40.0 + insets[1]);
     });
@@ -121,6 +122,8 @@ impl Rows {
             pick: false,
             selected: None,
             remove: None,
+            dequeue: None,
+            not_interested: false,
         }
     }
 }
@@ -166,21 +169,22 @@ fn card_row(ui: &mut Ui, id: &str, title: &str, cards: &[Card], acts: &mut Vec<A
     if cards.is_empty() {
         return;
     }
-    let (l, r) = shelf_header(ui, title, None, None, true);
+    let (l, r, _) = shelf_header(ui, title, None, None, true, false);
     let nudge = r as i32 - l as i32;
     h_scroll(ui, id, nudge, cards.len(), CARD, 18.0, |ui| {
         ui.spacing_mut().item_spacing.x = 18.0;
         for c in cards {
-            card(ui, c, CARD, false, acts);
+            card(ui, c, CARD, false, false, acts);
         }
     });
 }
 
 /// Songs laid out in columns of `rows`, scrolling sideways (Quick picks). Clicking a
-/// song starts its radio. Returns whether the arrows reached the end.
+/// song starts its radio. `not_interested`: the songs Home can be told to stop showing.
+/// Returns whether the arrows reached the end.
 #[allow(clippy::too_many_arguments)]
-fn song_grid(ui: &mut Ui, rows_ctx: &Rows, liked: &HashSet<String>, acts: &mut Vec<Action>, id: &str, title: &str, strap: Option<&str>, tracks: &[Track], rows: usize) -> bool {
-    let (l, r) = shelf_header(ui, title, strap, None, true);
+fn song_grid(ui: &mut Ui, rows_ctx: &Rows, liked: &HashSet<String>, acts: &mut Vec<Action>, id: &str, title: &str, strap: Option<&str>, tracks: &[Track], rows: usize, not_interested: Option<&HashMap<String, String>>) -> bool {
+    let (l, r, _) = shelf_header(ui, title, strap, None, true, false);
     let nudge = r as i32 - l as i32;
     let col_w = (ui.available_width() / 2.6).clamp(300.0, 420.0);
     let tracks: Vec<&Track> = tracks.iter().filter(|t| rows_ctx.shows(t)).collect();
@@ -192,7 +196,7 @@ fn song_grid(ui: &mut Ui, rows_ctx: &Rows, liked: &HashSet<String>, acts: &mut V
                 ui.set_width(col_w);
                 ui.vertical(|ui| {
                     for (i, t) in col.iter().enumerate() {
-                        let o = rows_ctx.opts(liked, t, None, false);
+                        let o = RowOpts { not_interested: not_interested.is_some_and(|n| n.contains_key(&t.id)), ..rows_ctx.opts(liked, t, None, false) };
                         if track_row(ui, t, &o, acts).clicked() {
                             picked = Some(c * rows + i);
                         }
@@ -412,20 +416,23 @@ fn home(app: &mut App, ui: &mut Ui, now: f64) {
                     continue;
                 }
                 let (strap, thumb) = if s.title == "Listen again" { (None, None) } else { (s.strapline.as_deref(), s.strap_thumb.as_deref()) };
-                let (l, r) = shelf_header(ui, &s.title, strap, thumb, true);
+                let (l, r, more) = shelf_header(ui, &s.title, strap, thumb, true, s.more.is_some());
                 let nudge = r as i32 - l as i32;
                 let acts = &mut app.actions;
+                if more && let Some(f) = &s.more {
+                    acts.push(Action::Go(Page::Feed(f.clone())));
+                }
                 let liked = &app.liked;
                 h_scroll(ui, &id, nudge, cards.len(), CARD, 18.0, |ui| {
                     ui.spacing_mut().item_spacing.x = 18.0;
                     for c in cards {
                         let is_liked = matches!(&c.target, Target::Song(t) if liked.contains(&t.id));
-                        card(ui, c, CARD, is_liked, acts);
+                        card(ui, c, CARD, is_liked, s.not_interested.contains_key(c.target.key()), acts);
                     }
                 });
             }
             ShelfKind::Songs { tracks, rows: n } => {
-                let reached_end = song_grid(ui, &rows, &app.liked, &mut app.actions, &id, &s.title, s.strapline.as_deref(), tracks, *n);
+                let reached_end = song_grid(ui, &rows, &app.liked, &mut app.actions, &id, &s.title, s.strapline.as_deref(), tracks, *n, Some(&s.not_interested));
                 if s.title == "Quick picks" && reached_end && !h.picks_loading && !h.picks_expanded {
                     more_picks = tracks.last().map(|t| t.id.clone());
                 }
@@ -444,6 +451,28 @@ fn home(app: &mut App, ui: &mut Ui, now: f64) {
     }
 }
 
+// ------------------------------------------------------------------ a shelf's page
+
+/// All of a home shelf (Listen again's "More"): its cards, wrapping down the page.
+fn feed(app: &mut App, ui: &mut Ui, f: &Feed, now: f64) {
+    page_title(ui, &f.title);
+    ui.add_space(18.0);
+    if app.feed.as_ref().is_none_or(|(shown, _)| shown != f) {
+        placeholder(app, ui, now, 3, CARD);
+        return;
+    }
+    let rows = Rows::new(app, now);
+    let Some((_, cards)) = &app.feed else { return };
+    let (liked, acts) = (&app.liked, &mut app.actions);
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = vec2(20.0, 22.0);
+        for c in cards.iter().filter(|c| !matches!(&c.target, Target::Song(t) if !rows.shows(t))) {
+            let is_liked = matches!(&c.target, Target::Song(t) if liked.contains(&t.id));
+            card(ui, c, CARD, is_liked, false, acts);
+        }
+    });
+}
+
 // ------------------------------------------------------------------ explore
 
 fn explore(app: &mut App, ui: &mut Ui, now: f64) {
@@ -456,7 +485,7 @@ fn explore(app: &mut App, ui: &mut Ui, now: f64) {
     let Some(e) = &app.explore else { return };
     card_row(ui, "ex-new", if app.logged_in { "New releases for you" } else { "Popular new releases" }, &e.new_albums, &mut app.actions);
     if !e.top.is_empty() {
-        song_grid(ui, &rows, &app.liked, &mut app.actions, "ex-top", "Top songs", None, &e.top, 4);
+        song_grid(ui, &rows, &app.liked, &mut app.actions, "ex-top", "Top songs", None, &e.top, 4, None);
     }
     card_row(ui, "ex-charts", "Charts", &e.charts, &mut app.actions);
 }
@@ -862,7 +891,7 @@ fn artist(app: &mut App, ui: &mut Ui, id: &str, now: f64) {
     card_row(ui, "a-pl", "Featured on", &a.playlists, acts);
     card_row(ui, "a-sim", "Fans might also like", &a.similar, acts);
     if let Some(d) = a.description.as_deref().filter(|d| !d.trim().is_empty()) {
-        shelf_header(ui, "About", None, None, false);
+        shelf_header(ui, "About", None, None, false, false);
         let g = widgets::galley_wrapped(ui, d.trim(), theme::regular(14.5), theme::text_dim(), ui.available_width().min(820.0), 8);
         ui.label(g);
     }
@@ -912,7 +941,7 @@ fn library(app: &mut App, ui: &mut Ui, tab: LibTab, now: f64) {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = vec2(20.0, 22.0);
             for c in cards {
-                card(ui, c, CARD, false, acts);
+                card(ui, c, CARD, false, false, acts);
             }
         });
     };

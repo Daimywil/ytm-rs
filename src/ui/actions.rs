@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use crate::backend::Req;
-use crate::model::{Target, Track};
+use crate::model::{ShelfKind, Target, Track};
 
 use super::lists::LIKED_MUSIC;
 use super::queue::QueueFill;
@@ -154,6 +154,25 @@ impl App {
                 if !self.logged_in { self.toast("Sign in to rate songs"); return; }
                 self.set_liked(std::slice::from_ref(&t), false);
                 self.backend.request(Req::Dislike(t.id));
+            }
+            Action::NotInterested(target) => {
+                let key = target.key().to_owned();
+                let Some(h) = &mut self.home else { return };
+                let Some(token) = h.shelves.iter().find_map(|s| s.not_interested.get(&key).cloned()) else { return };
+                // Gone from Home at once, wherever it's listed; YouTube Music leaves it out from now on.
+                for s in &mut h.shelves {
+                    s.not_interested.remove(&key);
+                    match &mut s.kind {
+                        ShelfKind::Cards(cards) => cards.retain(|c| c.target.key() != key),
+                        ShelfKind::Songs { tracks, .. } => tracks.retain(|t| t.id != key),
+                    }
+                }
+                h.shelves.retain(|s| match &s.kind {
+                    ShelfKind::Cards(cards) => !cards.is_empty(),
+                    ShelfKind::Songs { tracks, .. } => !tracks.is_empty(),
+                });
+                self.backend.request(Req::NotInterested(token));
+                self.toast("Removed from Home");
             }
             Action::Share(target) => {
                 self.share_pending = Some(share_url(&target));

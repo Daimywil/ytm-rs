@@ -23,6 +23,10 @@ pub enum Req {
     Home(Option<String>),
     HomeMore(String),
     MoreQuickPicks(String),
+    /// All of what a home shelf shows the start of (its "More").
+    Feed(model::Feed),
+    /// An item's "Not interested" token: YouTube Music takes it off Home.
+    NotInterested(String),
     Explore(Vec<String>),
     Search(String),
     /// Suggestions for a query; `round` comes back with them, so stale ones can be dropped.
@@ -104,6 +108,8 @@ impl Req {
         match self {
             Req::Home(_) | Req::HomeMore(_) => "Loading home",
             Req::MoreQuickPicks(_) => "Loading more picks",
+            Req::Feed(_) => "Loading the page",
+            Req::NotInterested(_) => "Not interested",
             Req::Explore(_) => "Loading explore",
             Req::Search(_) => "Search",
             Req::Suggest { .. } => "Suggest",
@@ -283,6 +289,8 @@ pub enum Resp {
     Home(ytm::HomePage),
     HomeMore(ytm::HomePage),
     QuickPicksMore { seed: String, tracks: Vec<Track> },
+    /// The cards of a shelf's "More" page.
+    Feed { feed: model::Feed, cards: Vec<Card> },
     Explore(Explore),
     Search(SearchResults),
     /// `None`: this video can't be shown; the picture stays.
@@ -348,6 +356,7 @@ impl Resp {
             Resp::Home(_)
                 | Resp::HomeMore(_)
                 | Resp::QuickPicksMore { .. }
+                | Resp::Feed { .. }
                 | Resp::Suggest { .. }
                 | Resp::Library(_)
                 | Resp::History(_)
@@ -736,6 +745,14 @@ impl Backend {
                 Req::MoreQuickPicks(seed) => {
                     let tracks = ytm::radio(api, &seed, me, 0).await?;
                     Resp::QuickPicksMore { seed, tracks }
+                }
+                Req::Feed(feed) => {
+                    let cards = ytm::feed_cards(api, &feed, me).await?;
+                    Resp::Feed { feed, cards }
+                }
+                Req::NotInterested(token) => {
+                    ytm::not_interested(api, &token).await?;
+                    return Ok(None);
                 }
                 Req::Explore(preferred_artists) => self.explore(&preferred_artists, me).await?,
                 Req::Search(query) => self.search(query, me).await?,

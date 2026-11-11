@@ -122,6 +122,16 @@ pub enum Target {
     Artist(String),
 }
 
+impl Target {
+    /// What tells it apart from the others of a shelf: a song's video id, or the page's id.
+    pub fn key(&self) -> &str {
+        match self {
+            Target::Song(t) => &t.id,
+            Target::Album(id) | Target::Playlist(id) | Target::Artist(id) => id,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Card {
     pub title: String,
@@ -149,6 +159,19 @@ pub struct Shelf {
     pub strapline: Option<String>,
     pub strap_thumb: Option<String>,
     pub kind: ShelfKind,
+    /// The page with all of it, when the shelf is only its start (its "More").
+    pub more: Option<Feed>,
+    /// The token that tells YouTube Music you're not interested in an item, by the item's
+    /// [`Target::key`]: its menu's "Not interested".
+    pub not_interested: std::collections::HashMap<String, String>,
+}
+
+/// A page of cards that a shelf opens with its "More" (all of Listen again).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Feed {
+    pub id: String,
+    pub params: Option<String>,
+    pub title: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]

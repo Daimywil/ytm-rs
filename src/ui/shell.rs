@@ -529,7 +529,7 @@ pub fn sidebar(app: &mut App, ui: &mut Ui) {
                     app.actions.push(Action::Open(c.target.clone()));
                 }
                 // Right-click: the menu a playlist's card has.
-                resp.context_menu(|ui| widgets::card_menu_contents(ui, c, false, &mut app.actions));
+                resp.context_menu(|ui| widgets::card_menu_contents(ui, c, false, false, &mut app.actions));
             }
             match dropped {
                 Some((id, t)) if id == "LM" => {
@@ -1326,7 +1326,7 @@ pub fn player_bar(app: &mut App, ui: &mut Ui, now: f64) {
             ui.painter().set(slot, egui::epaint::RectShape::filled(block, r, theme::glass(a)));
         }
         for r in &menu_on {
-            widgets::context_popup(r).show(|ui| widgets::song_menu(ui, t, liked, None, &mut app.actions));
+            widgets::context_popup(r).show(|ui| widgets::song_menu(ui, t, liked, None, false, &mut app.actions));
         }
         let lresp = ui.interact(lr, ui.scope_id().with("like"), Sense::click());
         let lresp = named(lresp, if liked { "Remove like" } else { "Like" }).on_hover_text(if liked { "Remove like" } else { "Like" }).on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -1670,21 +1670,13 @@ pub fn queue_list(app: &mut App, ui: &mut Ui, salt: &str) {
             if movable && !current {
                 row_drag::grip(ui, drag, list, i, t);
             }
-            let o = widgets::RowOpts { current, added_by: by.get(&t.id).cloned(), ..rows.opts(liked, t, None, false) };
+            // Any song to come can be taken out, where its length stands.
+            let dequeue = (!current && drag.is_none()).then_some(i);
+            let o = widgets::RowOpts { current, dequeue, added_by: by.get(&t.id).cloned(), ..rows.opts(liked, t, None, false) };
             let resp = widgets::track_row(ui, t, &o, acts);
             if resp.clicked() {
                 // The playing row pauses/resumes instead of doing nothing.
                 acts.push(if current { Action::TogglePlay } else { Action::QueueJump(i) });
-            }
-            if !current && drag.is_none() && ui.rect_contains_pointer(Rect::from_min_max(resp.rect.min, pos2(resp.rect.right() + 42.0, resp.rect.bottom()))) {
-                // Remove button over the duration column.
-                let x = Rect::from_center_size(resp.rect.right_center() - vec2(26.0, 0.0), Vec2::splat(28.0));
-                let xr = named(ui.interact(x, resp.id.with("rm"), Sense::click()), "Remove from queue").on_hover_cursor(egui::CursorIcon::PointingHand);
-                ui.painter().circle_filled(x.center(), 14.0, theme::panel(0.6));
-                icon_at(ui, x.center(), icon::X, 14.0, theme::text());
-                if xr.clicked() {
-                    acts.push(Action::QueueRemove(i));
-                }
             }
         });
         let lowest = if has_current { start + 1 } else { start };

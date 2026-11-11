@@ -5,7 +5,7 @@
 use serde_json::{Value, json};
 
 use crate::backend::{ArtistPage, Collection};
-use crate::model::{Card, Chip, Link, Shelf, ShelfKind, Target, Thumb, Track};
+use crate::model::{Card, Chip, Feed, Link, Shelf, ShelfKind, Target, Thumb, Track};
 use crate::ytmapi::Api;
 
 pub struct HomePage {
@@ -1359,22 +1359,78 @@ fn shelf(s: &Value) -> Option<Shelf> {
     let strapline = text(&h["strapline"]);
     let strap_thumb = thumbs(&h["thumbnail"]["musicThumbnailRenderer"]).into_iter().next().map(|t| t.url);
     let items: Vec<&Value> = arr(&r["contents"]).iter().filter(|i| !is_video(i)).collect();
+    let mut not_interested = std::collections::HashMap::new();
+    let mut note = |key: &str, item: &Value| {
+        if let Some(token) = not_interested_token(item) {
+            not_interested.insert(key.to_owned(), token);
+        }
+    };
     let kind = if podcasts() && items.iter().any(|i| !i["musicMultiRowListItemRenderer"].is_null()) {
         let tracks: Vec<Track> = items.iter().filter_map(|i| episode(&i["musicMultiRowListItemRenderer"])).collect();
         let rows = r["numItemsPerColumn"].as_str().and_then(|n| n.parse().ok()).unwrap_or(3);
         ShelfKind::Songs { tracks, rows }
     } else if items.iter().any(|i| !i["musicResponsiveListItemRenderer"].is_null()) {
-        let tracks: Vec<Track> = items.iter().filter_map(|i| list_item(&i["musicResponsiveListItemRenderer"])).collect();
+        let tracks: Vec<Track> = items.iter().filter_map(|i| list_item(&i["musicResponsiveListItemRenderer"]).inspect(|t| note(&t.id, &i["musicResponsiveListItemRenderer"]))).collect();
         let rows = r["numItemsPerColumn"].as_str().and_then(|n| n.parse().ok()).unwrap_or(4);
         ShelfKind::Songs { tracks, rows }
     } else {
-        ShelfKind::Cards(items.iter().filter_map(|i| two_row(&i["musicTwoRowItemRenderer"])).collect())
+        ShelfKind::Cards(items.iter().filter_map(|i| two_row(&i["musicTwoRowItemRenderer"]).inspect(|c| note(c.target.key(), &i["musicTwoRowItemRenderer"]))).collect())
     };
     let empty = match &kind {
         ShelfKind::Cards(c) => c.is_empty(),
         ShelfKind::Songs { tracks, .. } => tracks.is_empty(),
     };
-    (!empty).then_some(Shelf { title, strapline, strap_thumb, kind })
+    let more = feed(&h["moreContentButton"]["buttonRenderer"]["navigationEndpoint"], &title);
+    (!empty).then_some(Shelf { title, strapline, strap_thumb, kind, more, not_interested })
+}
+
+/// The page a shelf's "More" opens, when it's one of YouTube Music's own lists of cards
+/// ("FEmusic_listen_again") rather than an album, an artist or a button that plays.
+fn feed(nav: &Value, title: &str) -> Option<Feed> {
+    let browse = &nav["browseEndpoint"];
+    let id = browse["browseId"].as_str().filter(|id| id.starts_with("FEmusic_") && page_type(nav).is_none())?;
+    Some(Feed { id: id.to_owned(), params: browse["params"].as_str().map(str::to_owned), title: title.to_owned() })
+}
+
+/// The token an item's "Not interested" sends (a card's or a row's menu).
+fn not_interested_token(item: &Value) -> Option<String> {
+    arr(&item["menu"]["menuRenderer"]["items"]).iter().find_map(|m| {
+        let m = &m["menuServiceItemRenderer"];
+        (m["icon"]["iconType"] == "NOT_INTERESTED").then(|| m["serviceEndpoint"]["feedbackEndpoint"]["feedbackToken"].as_str().map(str::to_owned))?
+    })
+}
+
+/// Tell YouTube Music you're not interested in a home item (its token): it leaves Home
+/// and counts against recommending the like.
+pub async fn not_interested(api: &Api, token: &str) -> anyhow::Result<()> {
+    let v = api.call_signed_in("feedback", json!({ "feedbackTokens": [token] })).await?;
+    anyhow::ensure!(v["feedbackResponses"][0]["isProcessed"] == true, "YouTube Music didn't take it");
+    Ok(())
+}
+
+/// Everything a shelf's "More" lists: all of Listen again, where Home shows its first 20.
+pub async fn feed_cards(api: &Api, feed: &Feed, auth: bool) -> anyhow::Result<Vec<Card>> {
+    let mut body = json!({ "browseId": feed.id });
+    if let Some(p) = &feed.params {
+        body["params"] = json!(p);
+    }
+    let cards = parse_feed(&api.call("browse", body, auth).await?);
+    anyhow::ensure!(!cards.is_empty(), "YouTube Music returned an empty page");
+    Ok(cards)
+}
+
+/// A page of cards: a grid, or shelves of them one after another. Without videos, as on
+/// Home, and each item once (the same song can be listed twice).
+fn parse_feed(v: &Value) -> Vec<Card> {
+    let sections = &v["contents"]["singleColumnBrowseResultsRenderer"]["tabs"][0]["tabRenderer"]["content"]["sectionListRenderer"]["contents"];
+    let mut seen = std::collections::HashSet::new();
+    arr(sections)
+        .iter()
+        .flat_map(|s| arr(&s["gridRenderer"]["items"]).iter().chain(arr(&s["musicCarouselShelfRenderer"]["contents"])))
+        .filter(|i| !is_video(i))
+        .filter_map(|i| two_row(&i["musicTwoRowItemRenderer"]))
+        .filter(|c| seen.insert(c.target.key().to_owned()))
+        .collect()
 }
 
 /// A square/round card (album, playlist, artist, or a song shown as a card).
@@ -1672,6 +1728,59 @@ fn browse_id(run: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A home card as the feed sends it: a song (`video`) or an album (`browse`), with
+    /// "Not interested" in its menu when it has a `token`.
+    fn home_card(title: &str, video: Option<&str>, browse: Option<&str>, token: Option<&str>) -> Value {
+        let nav = match (video, browse) {
+            (Some(v), _) => json!({"watchEndpoint": {"videoId": v}}),
+            (_, Some(b)) => json!({"browseEndpoint": {"browseId": b, "browseEndpointContextSupportedConfigs": {"browseEndpointContextMusicConfig": {"pageType": "MUSIC_PAGE_TYPE_ALBUM"}}}}),
+            _ => Value::Null,
+        };
+        let mut items = vec![json!({"menuServiceItemRenderer": {"icon": {"iconType": "QUEUE_PLAY_NEXT"}, "serviceEndpoint": {"queueAddEndpoint": {}}}})];
+        if let Some(t) = token {
+            // The token of its "Undo" sits inside the endpoint too: not that one.
+            let undo = json!({"openPopupAction": {"popup": {"notificationActionRenderer": {"actionButton": {"buttonRenderer": {"command": {"feedbackEndpoint": {"feedbackToken": "undo"}}}}}}}});
+            items.push(json!({"toggleMenuServiceItemRenderer": {"defaultIcon": {"iconType": "KEEP"}, "defaultServiceEndpoint": {"feedbackEndpoint": {"feedbackToken": "pin"}}}}));
+            items.push(json!({"menuServiceItemRenderer": {"icon": {"iconType": "NOT_INTERESTED"}, "serviceEndpoint": {"feedbackEndpoint": {"actions": [undo], "feedbackToken": t}}}}));
+            items.push(json!({"menuServiceItemRenderer": {"icon": {"iconType": "REMOVE_CIRCLE"}, "serviceEndpoint": {"feedbackEndpoint": {"feedbackToken": "artist"}}}}));
+        }
+        json!({"musicTwoRowItemRenderer": {"title": {"runs": [{"text": title}]}, "navigationEndpoint": nav, "menu": {"menuRenderer": {"items": items}}}})
+    }
+
+    fn home_shelf(title: &str, more: Value, contents: Vec<Value>) -> Value {
+        json!({"musicCarouselShelfRenderer": {
+            "header": {"musicCarouselShelfBasicHeaderRenderer": {"title": {"runs": [{"text": title}]}, "moreContentButton": {"buttonRenderer": {"text": {"runs": [{"text": "More"}]}, "navigationEndpoint": more}}}},
+            "contents": contents,
+        }})
+    }
+
+    #[test]
+    fn a_home_shelf_knows_its_more_page_and_what_not_interested_sends() {
+        let more = json!({"browseEndpoint": {"browseId": "FEmusic_listen_again", "params": "ggMEgAKgAw%3D%3D"}});
+        let s = shelf(&home_shelf("Listen again", more, vec![home_card("A", Some("vidA"), None, Some("tokA")), home_card("B", None, Some("MPREb_1"), Some("tokB")), home_card("C", Some("vidC"), None, None)])).unwrap();
+        assert_eq!(s.more, Some(Feed { id: "FEmusic_listen_again".into(), params: Some("ggMEgAKgAw%3D%3D".into()), title: "Listen again".into() }));
+        // By the song's id or the album's; an item without the menu row has none.
+        assert_eq!(s.not_interested.get("vidA").map(String::as_str), Some("tokA"));
+        assert_eq!(s.not_interested.get("MPREb_1").map(String::as_str), Some("tokB"));
+        assert_eq!(s.not_interested.len(), 2);
+
+        // "Play all" plays, and a More that opens an artist isn't a page of cards.
+        let plays = json!({"watchEndpoint": {"videoId": "vidA", "params": "x"}});
+        assert_eq!(shelf(&home_shelf("Your daily discover", plays, vec![home_card("A", Some("vidA"), None, None)])).unwrap().more, None);
+        let artist = json!({"browseEndpoint": {"browseId": "UC1", "browseEndpointContextSupportedConfigs": {"browseEndpointContextMusicConfig": {"pageType": "MUSIC_PAGE_TYPE_ARTIST"}}}});
+        assert_eq!(shelf(&home_shelf("More from X", artist, vec![home_card("A", Some("vidA"), None, None)])).unwrap().more, None);
+    }
+
+    #[test]
+    fn a_shelf_page_lists_each_song_once_and_no_videos() {
+        let mut video = home_card("Video", Some("vidV"), None, None);
+        video["musicTwoRowItemRenderer"]["navigationEndpoint"]["watchEndpoint"]["watchEndpointMusicSupportedConfigs"] = json!({"watchEndpointMusicConfig": {"musicVideoType": "MUSIC_VIDEO_TYPE_UGC"}});
+        let items = vec![home_card("A", Some("vidA"), None, None), video, home_card("B", None, Some("MPREb_1"), None), home_card("A again", Some("vidA"), None, None)];
+        let page = json!({"contents": {"singleColumnBrowseResultsRenderer": {"tabs": [{"tabRenderer": {"content": {"sectionListRenderer": {"contents": [{"gridRenderer": {"items": items}}]}}}}]}}});
+        let titles: Vec<String> = parse_feed(&page).into_iter().map(|c| c.title).collect();
+        assert_eq!(titles, ["A", "B"]);
+    }
 
     /// An `accountItem` as the account switcher lists it.
     fn account_item(name: &str, handle: Option<&str>, selected: bool, page: Option<&str>, datasync: &str) -> Value {

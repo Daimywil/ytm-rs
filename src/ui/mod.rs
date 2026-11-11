@@ -45,7 +45,7 @@ use crate::audio::{AudioEvent, AudioHandle};
 use crate::backend::{ArtistPage, Backend, Explore, Library, Req, Resp, SearchResults};
 use crate::lyrics::LyricsSet;
 use crate::media::Media;
-use crate::model::{Card, Chip, Shelf, Target, Track};
+use crate::model::{Card, Chip, Feed, Shelf, Target, Track};
 use crate::shader::Background;
 use crate::theme;
 use lists::{LIKED_MUSIC, Lists};
@@ -68,6 +68,8 @@ pub enum Page {
     Transfer,
     /// Listen together.
     Jam,
+    /// All of a home shelf: what its "More" opens.
+    Feed(Feed),
 }
 
 #[derive(Clone, Copy, PartialEq, Hash, Debug)]
@@ -192,6 +194,8 @@ pub enum Action {
     /// Like (or unlike) a selection of songs.
     LikeMany(Vec<Track>, bool),
     Dislike(Track),
+    /// A home item's "Not interested": it leaves Home, here and for the account.
+    NotInterested(Target),
     Share(Target),
     AddToPlaylist(Vec<Track>),
     /// Rows (indices into the open playlist) to take out of it.
@@ -360,6 +364,8 @@ pub struct App {
     // page data
     home: Option<HomeState>,
     home_loading: bool,
+    /// The shelf page last opened (Page::Feed), and its cards.
+    feed: Option<(Feed, Vec<Card>)>,
     explore: Option<Explore>,
     search: Option<SearchResults>,
     /// Albums and playlists opened lately, so going back to one shows it at once (and
@@ -690,6 +696,7 @@ impl App {
             suggest_due: None,
             home: None,
             home_loading: true,
+            feed: None,
             explore: None,
             search: None,
             lists: Lists::default(),
@@ -1002,6 +1009,7 @@ impl App {
                 Some(Req::Home(None))
             }
             Page::Explore => Some(Req::Explore(self.preferred_artist_ids())),
+            Page::Feed(f) => Some(Req::Feed(f.clone())),
             Page::Search(q) if self.search.as_ref().is_none_or(|s| &s.query != q) => Some(Req::Search(q.clone())),
             Page::Album(id) | Page::Playlist(id) => {
                 self.visit_list(id, matches!(self.page, Page::Album(_)));
@@ -1028,6 +1036,7 @@ impl App {
         let cached = match &self.page {
             Page::Home => self.home.is_some(),
             Page::Explore => self.explore.is_some(),
+            Page::Feed(f) => self.feed.as_ref().is_some_and(|(shown, _)| shown == f),
             Page::Album(id) | Page::Playlist(id) => self.opened(id).is_some(),
             Page::Artist(id) => self.artist.as_ref().is_some_and(|a| &a.id == id),
             Page::Library(LibTab::History) => self.history.is_some(),
